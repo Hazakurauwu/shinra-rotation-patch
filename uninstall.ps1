@@ -9,6 +9,22 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 Add-Type -AssemblyName System.Windows.Forms
 
+# See install.ps1 for why: the classic FolderBrowserDialog has no address
+# bar at all, so a pasted path can't be used -- this is the standard
+# workaround (Explorer-style OpenFileDialog in folder-pick mode).
+function Select-FolderDialog {
+    param([string]$description = "Select a folder")
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title = $description
+    $dlg.ValidateNames = $false
+    $dlg.CheckFileExists = $false
+    $dlg.CheckPathExists = $true
+    $dlg.FileName = "Select Folder"
+    $dlg.Filter = "Folders|`n"
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+    return [System.IO.Path]::GetDirectoryName($dlg.FileName)
+}
+
 function Find-PatchedFolder {
     param([string]$base)
     if ([string]::IsNullOrWhiteSpace($base) -or -not (Test-Path $base)) { return $null }
@@ -19,11 +35,18 @@ function Find-PatchedFolder {
     return $hits[0].Directory.FullName
 }
 
-function Test-ToolboxRunning {
-    foreach ($n in @("TeraToolbox","tera-toolbox")) {
-        if (Get-Process -Name $n -ErrorAction SilentlyContinue) { return $true }
-    }
-    return $false
+# Process-name checks only catch clients literally called
+# TeraToolbox/tera-toolbox -- Crazy-eSports-ClassicPlus runs under totally
+# different process names, so that check silently never fired for it.
+# Probing the file itself works regardless of what the launcher is named.
+function Test-FileLocked {
+    param([string]$path)
+    if (-not (Test-Path $path)) { return $false }
+    try {
+        $s = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $s.Close()
+        return $false
+    } catch { return $true }
 }
 
 Write-Host ""
@@ -36,7 +59,8 @@ $common = @(
     "$env:USERPROFILE\Desktop\TeraToolbox","$env:USERPROFILE\Desktop\TeraToolbox Private",
     "$env:USERPROFILE\Documents\TeraToolbox","$env:USERPROFILE\Downloads\TeraToolbox",
     "${env:ProgramFiles(x86)}\TeraToolbox","$env:ProgramFiles\TeraToolbox",
-    "C:\TeraToolbox","C:\TeraToolbox Private","D:\TeraToolbox"
+    "C:\TeraToolbox","C:\TeraToolbox Private","D:\TeraToolbox",
+    "$env:APPDATA","$env:LOCALAPPDATA"
 )
 $shinra = $null
 foreach ($c in $common) { $shinra = Find-PatchedFolder $c; if ($shinra) { break } }
@@ -48,25 +72,23 @@ if ($shinra) {
     if ($ans -match '^[nN]') { $shinra = $null }
 }
 if (-not $shinra) {
-    Write-Host "  A window will open. Select your TeraToolbox folder and click OK." -ForegroundColor Yellow
+    Write-Host "  A window will open. Type or paste the folder path and press Enter, or browse to it." -ForegroundColor Yellow
     Start-Sleep -Milliseconds 400
     while (-not $shinra) {
-        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-        $dlg.Description = "Select your TeraToolbox folder (or the ShinraMeter folder)"
-        $dlg.ShowNewFolderButton = $false
-        if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
+        $selected = Select-FolderDialog "Select your TeraToolbox folder (or the ShinraMeter folder)"
+        if (-not $selected) {
             Write-Host "  Cancelled. Nothing was changed." -ForegroundColor Red
             Read-Host "  Press Enter to exit"; exit 1
         }
-        $shinra = Find-PatchedFolder $dlg.SelectedPath
+        $shinra = Find-PatchedFolder $selected
         if (-not $shinra) { Write-Host "  No backup found there. Try again." -ForegroundColor Red }
     }
     Write-Host "  Using: $shinra" -ForegroundColor Cyan
 }
 
-if (Test-ToolboxRunning) {
+if (Test-FileLocked (Join-Path $shinra "DamageMeter.dll")) {
     Write-Host ""
-    Write-Host "  TeraToolbox seems to be running. Close it, then press Enter." -ForegroundColor Yellow
+    Write-Host "  The client still has DamageMeter.dll open. Close it, then press Enter." -ForegroundColor Yellow
     Read-Host
 }
 

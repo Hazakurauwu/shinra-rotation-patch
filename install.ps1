@@ -9,21 +9,68 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 Add-Type -AssemblyName System.Windows.Forms
 
-function Find-ShinraFolder {
-    param([string]$base)
-    if ([string]::IsNullOrWhiteSpace($base) -or -not (Test-Path $base)) { return $null }
-    $hits = Get-ChildItem -Path $base -Filter "DamageMeter.dll" -Recurse -File -ErrorAction SilentlyContinue
-    if (-not $hits) { return $null }
-    $pref = $hits | Where-Object { $_.Directory.Name -ieq "ShinraMeter" } | Select-Object -First 1
-    if ($pref) { return $pref.Directory.FullName }
-    return $hits[0].Directory.FullName
+# Classic System.Windows.Forms.FolderBrowserDialog (SHBrowseForFolder under
+# the hood) has no address bar at all -- you can't type or paste a path into
+# it, only click through the tree. This uses the standard workaround: the
+# modern Explorer-style OpenFileDialog in "pick a folder" mode, which DOES
+# have a normal path field you can paste into and press Enter on.
+function Select-FolderDialog {
+    param([string]$description = "Select a folder")
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title = $description
+    $dlg.ValidateNames = $false
+    $dlg.CheckFileExists = $false
+    $dlg.CheckPathExists = $true
+    $dlg.FileName = "Select Folder"
+    $dlg.Filter = "Folders|`n"
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+    return [System.IO.Path]::GetDirectoryName($dlg.FileName)
 }
 
-function Test-ToolboxRunning {
-    foreach ($n in @("TeraToolbox","tera-toolbox")) {
-        if (Get-Process -Name $n -ErrorAction SilentlyContinue) { return $true }
+# Scans every base folder and returns every DISTINCT folder that contains a
+# DamageMeter.dll (a person can have more than one -- e.g. a stock
+# TeraToolbox install for one server plus a separate private-server client
+# like Crazy-eSports-ClassicPlus for another. Every match across every base
+# is collected here; nothing stops at the first hit.
+function Find-ShinraFolders {
+    param([string[]]$bases)
+    $found = New-Object System.Collections.Generic.List[string]
+    foreach ($base in $bases) {
+        if ([string]::IsNullOrWhiteSpace($base) -or -not (Test-Path $base)) { continue }
+        $hits = Get-ChildItem -Path $base -Filter "DamageMeter.dll" -Recurse -File -ErrorAction SilentlyContinue
+        foreach ($h in $hits) {
+            $dir = $h.Directory.FullName
+            if (-not $found.Contains($dir)) { [void]$found.Add($dir) }
+        }
     }
-    return $false
+    return $found
+}
+
+# A single folder version of the search above, used by the manual
+# folder-picker fallback (still only expects one match there).
+function Find-ShinraFolder {
+    param([string]$base)
+    $hits = Find-ShinraFolders @($base)
+    if ($hits.Count -eq 0) { return $null }
+    $pref = $hits | Where-Object { (Split-Path $_ -Leaf) -ieq "ShinraMeter" } | Select-Object -First 1
+    if ($pref) { return $pref }
+    return $hits[0]
+}
+
+# Per-target check: is DamageMeter.dll in THIS specific folder actually
+# locked right now? A process-name check (the old approach) only catches
+# clients literally called TeraToolbox/tera-toolbox -- Crazy-eSports-
+# ClassicPlus runs as "ShinraMeter"/"TERA"/"TERA Europe Classic+ Launcher"
+# instead, so that check silently never fired for it. Probing the file
+# itself works regardless of what the launcher is named.
+function Test-FileLocked {
+    param([string]$path)
+    if (-not (Test-Path $path)) { return $false }
+    try {
+        $s = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $s.Close()
+        return $false
+    } catch { return $true }
 }
 
 Write-Host ""
@@ -31,7 +78,8 @@ Write-Host "  ============================================" -ForegroundColor Gre
 Write-Host "   ShinraMeter Rotation Patch - Installer" -ForegroundColor Green
 Write-Host "  ============================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "   IMPORTANT: close TeraToolbox completely before continuing." -ForegroundColor Yellow
+Write-Host "   IMPORTANT: close TeraToolbox (and any other meter client)" -ForegroundColor Yellow
+Write-Host "   completely before continuing." -ForegroundColor Yellow
 Write-Host ""
 
 # Patch DLL lives in a 'release' subfolder, or next to this script.
@@ -43,136 +91,166 @@ if (-not (Test-Path "$releaseDir\DamageMeter.dll")) {
     Read-Host "  Press Enter to exit"; exit 1
 }
 
-# 1. Auto-detect, with confirm + folder picker fallback
+# 1. Auto-detect every meter install on this PC, with confirm + folder
+#    picker fallback when nothing (or more than one, see below) is found.
 $common = @(
     "$env:USERPROFILE\Desktop\TeraToolbox","$env:USERPROFILE\Desktop\TeraToolbox Private",
     "$env:USERPROFILE\Documents\TeraToolbox","$env:USERPROFILE\Downloads\TeraToolbox",
     "${env:ProgramFiles(x86)}\TeraToolbox","$env:ProgramFiles\TeraToolbox",
-    "C:\TeraToolbox","C:\TeraToolbox Private","D:\TeraToolbox"
+    "C:\TeraToolbox","C:\TeraToolbox Private","D:\TeraToolbox",
+    # Private-server launchers (Crazy-eSports-ClassicPlus and similar) tend
+    # to install under AppData rather than any of the paths above.
+    "$env:APPDATA","$env:LOCALAPPDATA"
 )
-$shinra = $null
-foreach ($c in $common) { $shinra = Find-ShinraFolder $c; if ($shinra) { break } }
+$allHits = Find-ShinraFolders $common
 
-if ($shinra) {
+$targets = @()
+if ($allHits.Count -eq 1) {
+    $shinra = $allHits[0]
     Write-Host "  Found ShinraMeter at:" -ForegroundColor Cyan
     Write-Host "    $shinra"; Write-Host ""
     $ans = Read-Host "  Use this folder? Press Enter for yes, or type N to choose another"
-    if ($ans -match '^[nN]') { $shinra = $null }
-}
-if (-not $shinra) {
+    if ($ans -match '^[nN]') { $shinra = $null } else { $targets = @($shinra) }
+} elseif ($allHits.Count -ge 2) {
+    Write-Host "  Found more than one meter install on this PC:" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $allHits.Count; $i++) { Write-Host ("    [{0}] {1}" -f ($i + 1), $allHits[$i]) }
     Write-Host ""
-    Write-Host "  A window will open. Select your TeraToolbox folder" -ForegroundColor Yellow
-    Write-Host "  (or the ShinraMeter folder itself) and click OK." -ForegroundColor Yellow
+    while ($targets.Count -eq 0) {
+        $ans = Read-Host "  Type a number to patch just that one, or A to patch ALL of them"
+        if ($ans -match '^[aA]$') { $targets = $allHits }
+        elseif ($ans -match '^\d+$' -and [int]$ans -ge 1 -and [int]$ans -le $allHits.Count) { $targets = @($allHits[[int]$ans - 1]) }
+        else { Write-Host "  Not a valid choice, try again." -ForegroundColor Red }
+    }
+}
+if ($targets.Count -eq 0) {
+    Write-Host ""
+    Write-Host "  A window will open. Type or paste the path to your" -ForegroundColor Yellow
+    Write-Host "  TeraToolbox folder (or the ShinraMeter folder itself)" -ForegroundColor Yellow
+    Write-Host "  in the 'File name' box and press Enter, or browse to it." -ForegroundColor Yellow
     Start-Sleep -Milliseconds 400
-    while (-not $shinra) {
-        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-        $dlg.Description = "Select your TeraToolbox folder (or the ShinraMeter folder)"
-        $dlg.ShowNewFolderButton = $false
-        if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
+    $picked = $null
+    while (-not $picked) {
+        $selected = Select-FolderDialog "Select your TeraToolbox folder (or the ShinraMeter folder)"
+        if (-not $selected) {
             Write-Host "  Cancelled. Nothing was changed." -ForegroundColor Red
             Read-Host "  Press Enter to exit"; exit 1
         }
-        $shinra = Find-ShinraFolder $dlg.SelectedPath
-        if (-not $shinra) { Write-Host "  No ShinraMeter found there. Try again." -ForegroundColor Red }
+        $picked = Find-ShinraFolder $selected
+        if (-not $picked) { Write-Host "  No ShinraMeter found there. Try again." -ForegroundColor Red }
     }
-    Write-Host "  Using: $shinra" -ForegroundColor Cyan
+    Write-Host "  Using: $picked" -ForegroundColor Cyan
+    $targets = @($picked)
 }
 
-# Pick the right patch build for this specific meter. The default
-# release/DamageMeter.dll is built against a stock TeraToolbox ShinraMeter
-# (references DamageMeter.Sniffing.ToolboxSniffer internally). Some private
-# server clients (e.g. Crazy-eSports-ClassicPlus) ship a fork whose
-# DamageMeter.Sniffing.dll never defines that type at all -- installing the
-# default build there crashes on launch with a TypeLoadException. Detect it
-# with a plain substring probe on their own Sniffing.dll (no .NET reflection
-# needed, works from Windows PowerShell against any target framework) and
-# swap in the matching prebuilt DLL if one is shipped alongside this script.
-$sourceDll = Join-Path $releaseDir "DamageMeter.dll"
-$classicPlusDll = Join-Path $releaseDir "DamageMeter.classicplus.dll"
-$sniffDll = Join-Path $shinra "DamageMeter.Sniffing.dll"
-if ((Test-Path $classicPlusDll) -and (Test-Path $sniffDll)) {
-    try {
-        $usesToolboxSniffer = [bool](Select-String -Path $sniffDll -Pattern "ToolboxSniffer" -SimpleMatch -Quiet)
-        if (-not $usesToolboxSniffer) {
-            $sourceDll = $classicPlusDll
-            Write-Host "  Detected a Classic+ / Crazy-eSports style meter -- using the matching patch build." -ForegroundColor Cyan
-        }
-    } catch { } # any read error -> fall back to the default build
-}
+# Installs the patch into one specific meter folder: picks the matching
+# prebuilt DLL variant, backs up originals, copies the patch in, updates
+# module.json/manifest.json if present. Returns $true/$false.
+function Install-ToShinra {
+    param([string]$shinra)
 
-if (Test-ToolboxRunning) {
     Write-Host ""
-    Write-Host "  TeraToolbox seems to be running. Close it completely," -ForegroundColor Yellow
-    Write-Host "  then press Enter to continue." -ForegroundColor Yellow
-    Read-Host
-}
+    Write-Host "  --- $shinra ---" -ForegroundColor Cyan
 
-# 2. Back up originals (once)
-Write-Host ""
-Write-Host "  Backing up original files..."
-foreach ($f in @("DamageMeter.dll","module.json","manifest.json")) {
-    $src = Join-Path $shinra $f; $bak = "$src.prepatch.bak"
-    if ((Test-Path $src) -and -not (Test-Path $bak)) { Copy-Item $src $bak -Force; Write-Host "    backed up: $f" }
-}
+    if (Test-FileLocked (Join-Path $shinra "DamageMeter.dll")) {
+        Write-Host "  This meter's DamageMeter.dll is still open (client running)." -ForegroundColor Yellow
+        Write-Host "  Close it completely, then press Enter to continue." -ForegroundColor Yellow
+        Read-Host
+    }
 
-# Clean any leftover from the old (external-DLL) version of this patch
-$oldDll = Join-Path $shinra "ShinraRotationPatch.dll"
-if (Test-Path $oldDll) { Remove-Item $oldDll -Force; Write-Host "    removed old ShinraRotationPatch.dll" }
+    # Pick the right patch build for this specific meter. The default
+    # release/DamageMeter.dll is built against a stock TeraToolbox
+    # ShinraMeter (references DamageMeter.Sniffing.ToolboxSniffer
+    # internally). Some private server clients (e.g.
+    # Crazy-eSports-ClassicPlus) ship a fork whose DamageMeter.Sniffing.dll
+    # never defines that type at all -- installing the default build there
+    # crashes on launch with a TypeLoadException. Detected with a plain
+    # substring probe on their own Sniffing.dll (no .NET reflection needed,
+    # works from Windows PowerShell against any target framework).
+    $sourceDll = Join-Path $releaseDir "DamageMeter.dll"
+    $classicPlusDll = Join-Path $releaseDir "DamageMeter.classicplus.dll"
+    $sniffDll = Join-Path $shinra "DamageMeter.Sniffing.dll"
+    if ((Test-Path $classicPlusDll) -and (Test-Path $sniffDll)) {
+        try {
+            $usesToolboxSniffer = [bool](Select-String -Path $sniffDll -Pattern "ToolboxSniffer" -SimpleMatch -Quiet)
+            if (-not $usesToolboxSniffer) {
+                $sourceDll = $classicPlusDll
+                Write-Host "  Detected a Classic+ / Crazy-eSports style meter -- using the matching patch build." -ForegroundColor Cyan
+            }
+        } catch { } # any read error -> fall back to the default build
+    }
 
-# 3. Install the merged DamageMeter.dll
-Write-Host ""
-Write-Host "  Installing patched DamageMeter.dll..."
-try {
-    Copy-Item $sourceDll (Join-Path $shinra "DamageMeter.dll") -Force -ErrorAction Stop
-    Write-Host "    installed: DamageMeter.dll"
-} catch {
-    $msg = $_.Exception.Message
-    Write-Host ""
-    Write-Host "  ============================================" -ForegroundColor Red
-    if ($msg -match "being used|another process|0x80070020|in use") {
-        Write-Host "   TeraToolbox is still open and locking the file." -ForegroundColor Red
-        Write-Host "   Close it completely, then run this again." -ForegroundColor Red
-    } elseif ($msg -match "denied|Unauthorized") {
-        Write-Host "   Windows blocked writing. Right-click install.bat ->" -ForegroundColor Red
-        Write-Host "   Run as administrator." -ForegroundColor Red
-    } else { Write-Host "   $msg" -ForegroundColor Red }
-    Write-Host "  ============================================" -ForegroundColor Red
-    Read-Host "  Press Enter to exit"; exit 1
-}
+    Write-Host "  Backing up original files..."
+    foreach ($f in @("DamageMeter.dll","module.json","manifest.json")) {
+        $src = Join-Path $shinra $f; $bak = "$src.prepatch.bak"
+        if ((Test-Path $src) -and -not (Test-Path $bak)) { Copy-Item $src $bak -Force; Write-Host "    backed up: $f" }
+    }
 
-# 4. Turn OFF auto-update in module.json (so the toolbox won't overwrite the patch)
-$modPath = Join-Path $shinra "module.json"
-if (Test-Path $modPath) {
+    # Clean any leftover from the old (external-DLL) version of this patch
+    $oldDll = Join-Path $shinra "ShinraRotationPatch.dll"
+    if (Test-Path $oldDll) { Remove-Item $oldDll -Force; Write-Host "    removed old ShinraRotationPatch.dll" }
+
+    Write-Host "  Installing patched DamageMeter.dll..."
     try {
-        $mod = Get-Content $modPath -Raw | ConvertFrom-Json
-        if ($mod.PSObject.Properties.Name -contains 'disableAutoUpdate') { $mod.disableAutoUpdate = $true }
-        else { $mod | Add-Member -NotePropertyName disableAutoUpdate -NotePropertyValue $true }
-        $json = $mod | ConvertTo-Json -Depth 20
-        [System.IO.File]::WriteAllText($modPath, $json, (New-Object System.Text.UTF8Encoding($false)))
-        Write-Host "    auto-update disabled in module.json"
-    } catch { Write-Host "    WARNING: could not edit module.json: $($_.Exception.Message)" -ForegroundColor Yellow }
+        Copy-Item $sourceDll (Join-Path $shinra "DamageMeter.dll") -Force -ErrorAction Stop
+        Write-Host "    installed: DamageMeter.dll"
+    } catch {
+        $msg = $_.Exception.Message
+        Write-Host ""
+        if ($msg -match "being used|another process|0x80070020|in use") {
+            Write-Host "   The client is still open and locking the file. Close it completely, then run this again." -ForegroundColor Red
+        } elseif ($msg -match "denied|Unauthorized") {
+            Write-Host "   Windows blocked writing. Right-click install.bat -> Run as administrator." -ForegroundColor Red
+        } else { Write-Host "   $msg" -ForegroundColor Red }
+        return $false
+    }
+
+    # Turn OFF auto-update in module.json (so the toolbox won't overwrite the patch)
+    $modPath = Join-Path $shinra "module.json"
+    if (Test-Path $modPath) {
+        try {
+            $mod = Get-Content $modPath -Raw | ConvertFrom-Json
+            if ($mod.PSObject.Properties.Name -contains 'disableAutoUpdate') { $mod.disableAutoUpdate = $true }
+            else { $mod | Add-Member -NotePropertyName disableAutoUpdate -NotePropertyValue $true }
+            $json = $mod | ConvertTo-Json -Depth 20
+            [System.IO.File]::WriteAllText($modPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "    auto-update disabled in module.json"
+        } catch { Write-Host "    WARNING: could not edit module.json: $($_.Exception.Message)" -ForegroundColor Yellow }
+    }
+
+    # Recompute manifest.json hash for the new DamageMeter.dll (toolbox validates this)
+    $manPath = Join-Path $shinra "manifest.json"
+    if (Test-Path $manPath) {
+        try {
+            $man = Get-Content $manPath -Raw | ConvertFrom-Json
+            $newHash = (Get-FileHash (Join-Path $shinra "DamageMeter.dll") -Algorithm SHA256).Hash.ToLower()
+            if ($man.files.PSObject.Properties.Name -contains 'DamageMeter.dll') { $man.files.'DamageMeter.dll' = $newHash }
+            # drop stale entry from the old external-DLL version of this patch
+            if ($man.files.PSObject.Properties.Name -contains 'ShinraRotationPatch.dll') {
+                $man.files.PSObject.Properties.Remove('ShinraRotationPatch.dll')
+            }
+            $json = $man | ConvertTo-Json -Depth 30
+            [System.IO.File]::WriteAllText($manPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "    manifest updated for DamageMeter.dll"
+        } catch { Write-Host "    WARNING: could not update manifest: $($_.Exception.Message)" -ForegroundColor Yellow }
+    }
+
+    return $true
 }
 
-# 5. Recompute manifest.json hash for the new DamageMeter.dll (toolbox validates this)
-$manPath = Join-Path $shinra "manifest.json"
-if (Test-Path $manPath) {
-    try {
-        $man = Get-Content $manPath -Raw | ConvertFrom-Json
-        $newHash = (Get-FileHash (Join-Path $shinra "DamageMeter.dll") -Algorithm SHA256).Hash.ToLower()
-        if ($man.files.PSObject.Properties.Name -contains 'DamageMeter.dll') { $man.files.'DamageMeter.dll' = $newHash }
-        # drop stale entry from the old external-DLL version of this patch
-        if ($man.files.PSObject.Properties.Name -contains 'ShinraRotationPatch.dll') {
-            $man.files.PSObject.Properties.Remove('ShinraRotationPatch.dll')
-        }
-        $json = $man | ConvertTo-Json -Depth 30
-        [System.IO.File]::WriteAllText($manPath, $json, (New-Object System.Text.UTF8Encoding($false)))
-        Write-Host "    manifest updated for DamageMeter.dll"
-    } catch { Write-Host "    WARNING: could not update manifest: $($_.Exception.Message)" -ForegroundColor Yellow }
-}
+$results = @{}
+foreach ($t in $targets) { $results[$t] = Install-ToShinra $t }
 
 Write-Host ""
 Write-Host "  ============================================" -ForegroundColor Green
-Write-Host "   Done! Start TeraToolbox to use the patch." -ForegroundColor Green
+$anyFail = $false
+foreach ($t in $targets) {
+    if ($results[$t]) { Write-Host "   OK   $t" -ForegroundColor Green }
+    else { Write-Host "   FAIL $t" -ForegroundColor Red; $anyFail = $true }
+}
+if (-not $anyFail) {
+    Write-Host ""
+    Write-Host "   Done! Start the client(s) to use the patch." -ForegroundColor Green
+}
 Write-Host ""
 Write-Host "   Originals saved as *.prepatch.bak"
 Write-Host "   To undo, run uninstall.bat"
