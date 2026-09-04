@@ -78,6 +78,28 @@ if (-not $shinra) {
     Write-Host "  Using: $shinra" -ForegroundColor Cyan
 }
 
+# Pick the right patch build for this specific meter. The default
+# release/DamageMeter.dll is built against a stock TeraToolbox ShinraMeter
+# (references DamageMeter.Sniffing.ToolboxSniffer internally). Some private
+# server clients (e.g. Crazy-eSports-ClassicPlus) ship a fork whose
+# DamageMeter.Sniffing.dll never defines that type at all -- installing the
+# default build there crashes on launch with a TypeLoadException. Detect it
+# with a plain substring probe on their own Sniffing.dll (no .NET reflection
+# needed, works from Windows PowerShell against any target framework) and
+# swap in the matching prebuilt DLL if one is shipped alongside this script.
+$sourceDll = Join-Path $releaseDir "DamageMeter.dll"
+$classicPlusDll = Join-Path $releaseDir "DamageMeter.classicplus.dll"
+$sniffDll = Join-Path $shinra "DamageMeter.Sniffing.dll"
+if ((Test-Path $classicPlusDll) -and (Test-Path $sniffDll)) {
+    try {
+        $usesToolboxSniffer = [bool](Select-String -Path $sniffDll -Pattern "ToolboxSniffer" -SimpleMatch -Quiet)
+        if (-not $usesToolboxSniffer) {
+            $sourceDll = $classicPlusDll
+            Write-Host "  Detected a Classic+ / Crazy-eSports style meter -- using the matching patch build." -ForegroundColor Cyan
+        }
+    } catch { } # any read error -> fall back to the default build
+}
+
 if (Test-ToolboxRunning) {
     Write-Host ""
     Write-Host "  TeraToolbox seems to be running. Close it completely," -ForegroundColor Yellow
@@ -101,7 +123,7 @@ if (Test-Path $oldDll) { Remove-Item $oldDll -Force; Write-Host "    removed old
 Write-Host ""
 Write-Host "  Installing patched DamageMeter.dll..."
 try {
-    Copy-Item "$releaseDir\DamageMeter.dll" (Join-Path $shinra "DamageMeter.dll") -Force -ErrorAction Stop
+    Copy-Item $sourceDll (Join-Path $shinra "DamageMeter.dll") -Force -ErrorAction Stop
     Write-Host "    installed: DamageMeter.dll"
 } catch {
     $msg = $_.Exception.Message

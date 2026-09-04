@@ -72,5 +72,6 @@ The hit-by-hit data is only attached to uploads going to **enragedon.com**. Any 
 ## Notes
 
 - Works on Windows 10 and 11
-- The patched code is merged into `DamageMeter.dll` as a single self-contained file, so it works on any TeraToolbox ShinraMeter build (no dependency on how that build loads assemblies)
-- If ShinraMeter updates to a new version, the patch needs to be reapplied with `build-patch.ps1`
+- The patched code is merged into `DamageMeter.dll` as a single self-contained file (no dependency on how that build loads assemblies)
+- The installer ships two prebuilt variants (one per known meter fork -- currently a stock TeraToolbox ShinraMeter and the Crazy-eSports-ClassicPlus client) and auto-detects which one matches your `DamageMeter.Sniffing.dll` before installing, so the same zip works for both without asking anything
+- If ShinraMeter updates to a new version, or a new private-server client ships its own fork, the patch needs to be rebuilt against that specific build with `build-patch.ps1 -MeterDir <that client's folder> -OutDir <somewhere>` and the resulting DLL added as a new variant
